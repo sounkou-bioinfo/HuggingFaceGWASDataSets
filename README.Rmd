@@ -1,0 +1,102 @@
+---
+output: github_document
+---
+
+<!-- README.md is generated from README.Rmd. Please edit that file -->
+For the #RStats using peasants
+
+using {huggingfaceR}
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.path = "man/figures/README-",
+  out.width = "100%"
+)
+```
+
+```{r}
+huggingfaceR::hf_load_dataset(dataset = "OpenMed/pgc-schizophrenia", split = "train", limit = 1000)
+```
+
+Or {duckdb} + base R + {jsonlite}
+
+```{r}
+DatasetParquetUrlList <- function(repo = "OpenMed/pgc-schizophrenia", dataset = "scz2011", split = "train") {
+  # curl -X GET \
+  #   "https://huggingface.co/api/datasets/OpenMed/pgc-schizophrenia/parquet/scz2011/train"
+  urlList <- readLines(
+    paste0(
+      "https://huggingface.co/api/datasets/",
+      repo,
+      "/parquet/", dataset, "/", split
+    ),
+    warn = FALSE
+  ) |>
+    jsonlite::fromJSON(simplifyVector = FALSE) |>
+    unlist()
+  urlList
+}
+
+DatasetParquetUrlList() |> head()
+
+OpenRemoteParquetView <- function(
+  urlList = DatasetParquetUrlList(),
+  view_name = "embeddings",
+  db_path = tempfile(fileext = ".duckdb"),
+  unify_schemas = FALSE
+) {
+  drv <- duckdb::duckdb()
+  if (is.null(db_path)) {
+    conn <- DBI::dbConnect(drv)
+  } else {
+    conn <- DBI::dbConnect(drv, dbdir = db_path)
+  }
+
+  DBI::dbExecute(conn, "INSTALL httpfs; LOAD httpfs;")
+
+  sql <- sprintf(
+    "CREATE OR REPLACE TEMPORARY VIEW %s AS SELECT * FROM parquet_scan(%s, UNION_BY_NAME=%s)",
+    view_name,
+    paste0("['", paste(urlList, collapse = "','"), "']"),
+    tolower(unify_schemas)
+  )
+  DBI::dbExecute(conn, sql)
+
+  list(
+    conn = conn,
+    tbl = dplyr::tbl(conn, view_name)
+  )
+}
+
+remote <- OpenRemoteParquetView()
+remote$tbl
+```
+
+ {duckdb} + duckhts for liftover to GRCh37
+
+```{r}
+DBI::dbExecute(remote$conn, "INSTALL duckhts FROM community;")
+DBI::dbExecute(remote$conn, "LOAD duckhts;")
+
+lifted_scz <- DBI::dbGetQuery(
+  remote$conn,
+  paste(
+    "SELECT src_chrom, src_pos, dest_chrom, dest_pos, mapped, reject_reason, note",
+    "FROM duckdb_liftover(",
+    "'(SELECT CAST(hg18chr AS VARCHAR) AS chrom, bp AS pos",
+    "FROM embeddings",
+    "WHERE hg18chr IS NOT NULL AND bp IS NOT NULL",
+    "LIMIT 1000) AS scz',",
+    "'chrom',",
+    "'pos',",
+    "chain_path := '/root/GRCh37/hg18ToHg19.over.chain.gz',",
+    "dst_fasta_ref := '/root/GRCh37/human_g1k_v37.fasta'",
+    ")"
+  )
+)
+
+dplyr::as_tibble(lifted_scz) |>
+  dplyr::slice_head(n = 10)
+```
